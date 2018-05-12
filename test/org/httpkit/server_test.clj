@@ -11,7 +11,8 @@
   (:require [clj-http.client :as http]
             [org.httpkit.ws-test :as ws]
             [org.httpkit.client :as client]
-            [clj-http.util :as u])
+            [clj-http.util :as u]
+            [clojure.core.async :refer [go go-loop chan thread timeout alts!! >! <! >!!]])
   (:import [java.io File FileOutputStream FileInputStream]
            org.httpkit.SpecialHttpClient
            (java.util.concurrent ThreadPoolExecutor TimeUnit ArrayBlockingQueue)))
@@ -404,3 +405,91 @@
     (server)
     (is (= "hello world" (:body @resp)))
     (is (= 200 (:status @resp)))))
+
+(deftest test-channel-reuse-async
+  ;; This is important to use since channels are only re-used across
+  ;; the same underlying socket connection.  This ensures that all
+  ;; client requests we issue will be on the same socket.
+  (http/with-async-connection-pool {:threads 1}
+    (let [ch0-open? (atom [])
+          ch0 (atom nil)
+          responses (atom {})
+          server (run-server
+                  (fn [req]
+                    (with-channel req ch
+                      (cond
+                        (= (:uri req) "/0")
+                        (do
+                          (reset! ch0 ch)
+                          (send! ch {:status 200
+                                     :headers {"Content-Type" "text/plain"}
+                                     :body "0"})
+
+                          ;; NOTE: At this point, this will fail
+                          ;; because the channel *does* get closed
+                          ;; after calling send!
+                          (swap! ch0-open? conj (send! ch {:status 200
+                                                           :headers {"Content-Type" "text/plain"}
+                                                           :body "0"}))
+                          )
+                        (= (:uri req) "/1")
+                        (do
+                          ;; ch0 is closed after the send! above, but
+                          ;; it gets re-opened during req1 and can
+                          ;; still be used.
+                          ;;
+                          ;; I put this send! here because the timing
+                          ;; is easiest to express this way.  If you
+                          ;; have previously send back a complete HTTP
+                          ;; response but have still held onto the
+                          ;; channel for some reason, you can end up
+                          ;; sending back a response that hi-jacks the
+                          ;; next HTTP response in sequence.
+                          ;;
+                          ;; This ends up happening reasonably often
+                          ;; for us, in particular due to how sente
+                          ;; behaves post-handshake.
+                          (swap! ch0-open? conj (send! @ch0 {:status 200
+                                                             :headers {"Content-Type" "text/plain"}
+                                                             :body "0"}))
+                          (send! ch {:status 200
+                                     :headers {"Content-Type" "text/plain"}
+                                     :body "1"}))
+                        (= (:uri req) "/2")
+                        (do
+                          ;; NOTE: The trailing requests in this
+                          ;; scenario do not need to use with-channel,
+                          ;; they can be fully synchronous responses
+                          ;; and still get overwritten.
+                          (swap! ch0-open? conj (send! @ch0 {:status 200
+                                                             :headers {"Content-Type" "text/plain"}
+                                                             :body "0"}))
+                          {:status 200
+                           :headers {"Content-Type" "text/plain"}
+                           :body "2"}))))
+                  {:port 3474
+                   :thread 1 ;; NOTE: Thread count doesn't actually matter here.
+                   })
+          _ (reset! tmp-server server)  ; this makes it easier to kill
+                                        ; the server during testing/repl
+                                        ; experimentation if something
+                                        ; isn't working as expected in
+                                        ; the test.
+
+          _ (dotimes [n 3]
+              (http/get (str "http://localhost:3474/" n)
+                        {:async? true}
+                        (fn [resp] (swap! responses assoc (str n) resp))
+                        (fn [resp] (swap! responses assoc (str n) resp))))]
+
+      (Thread/sleep 100)
+      (server)
+
+      ;; The expected state is after the first send! this channel
+      ;; should stay closed and further attempts to send! should fail.
+      (is (= @ch0-open? [false false false]))
+
+      ;; Each request to integer /N should return body N
+      (is (= "0" (:body (get @responses "0"))))
+      (is (= "1" (:body (get @responses "1"))))
+      (is (= "2" (:body (get @responses "2")))))))
